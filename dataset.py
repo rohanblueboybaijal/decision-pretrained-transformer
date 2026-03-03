@@ -197,6 +197,8 @@ class SequenceDataset(torch.utils.data.Dataset):
             res['query_actions'] = convert_to_tensor(traj['query_actions'], store_gpu=self.store_gpu)
         if 'query_values' in traj:
             res['query_values'] = convert_to_tensor(traj['query_values'], store_gpu=self.store_gpu)
+        if 'loss_mask' in traj:
+            res['loss_mask'] = convert_to_tensor(traj['loss_mask'], store_gpu=self.store_gpu)
 
         return res
 
