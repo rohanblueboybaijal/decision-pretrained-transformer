@@ -23,9 +23,6 @@ import argparse
 import os
 import pickle
 import random
-from collections import defaultdict
-
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -38,6 +35,34 @@ from dataset import collate_fn
 from eval_policy import evaluate_policy_on_envs
 from get_rollout_policy import get_rollout_policy
 from models import DecisionTransformer
+from viz.viz_common import sample_diverse_trajectories
+
+
+def generate_eval_video(eval_trajs, env_name, save_path, num_trajs=9):
+    """Render an MP4 video of sampled eval trajectories.
+
+    Dispatches to the appropriate env-specific renderer (darkroom or junction).
+    Returns save_path on success, None if the env has no video renderer.
+    """
+    learner_trajs = sample_diverse_trajectories(eval_trajs, num_trajs)
+
+    if "darkroom" in env_name:
+        from viz.viz_darkroom import render_trajectory_video, get_grid_dim
+        grid_dim = get_grid_dim(env_name)
+        render_trajectory_video(None, learner_trajs, grid_dim, save_path)
+    elif "junction" in env_name:
+        from viz.viz_junction import render_trajectory_video, get_corridor_length
+        corridor_length = get_corridor_length(env_name)
+        render_trajectory_video(None, learner_trajs, corridor_length, save_path)
+    elif "navigation" in env_name:
+        from viz.viz_navigation import render_trajectory_video, get_radius
+        radius = get_radius(env_name)
+        render_trajectory_video(None, learner_trajs, radius, save_path)
+    else:
+        print(f"Video visualization not supported for {env_name}, skipping.")
+        return None
+
+    return save_path
 
 
 def get_optimizer_scheduler(model, total_steps, lr, warmup_ratio):
@@ -133,6 +158,7 @@ def train_step(
     args,
     device,
     action_dim,
+    global_epoch_offset,
 ):
     """
     Train the model for one DAgger step (multiple epochs of supervised learning).
@@ -168,6 +194,7 @@ def train_step(
               gradient_clip, log_wandb.
         device: torch device.
         action_dim: Number of discrete actions.
+        global_epoch_offset: Starting global epoch for this DAgger step.
 
     Returns:
         model: The trained model (same object, updated in-place).
@@ -211,29 +238,26 @@ def train_step(
         return loss, {"loss": loss.item()}
 
     for epoch in tqdm.tqdm(range(args.num_epochs), desc=f"Training DAgger Step {step_id}"):
-        # --- Evaluation ---
+        global_epoch = global_epoch_offset + epoch
+
+        # --- Evaluation on test set ---
+        epoch_test_loss = None
         if epoch % eval_freq == 0 or epoch == args.num_epochs - 1:
             model.eval()
-            eval_stats = defaultdict(list)
+            test_losses = []
 
             with torch.no_grad():
                 for batch in test_loader:
                     loss, stats = forward(batch)
-                    for k, v in stats.items():
-                        eval_stats[k].append(v)
+                    test_losses.append(stats["loss"])
 
-            for k in eval_stats:
-                eval_stats[k] = np.mean(eval_stats[k])
-
-            if args.log_wandb:
-                for k, v in eval_stats.items():
-                    wandb.log({f"dagger-{step_id}/test_{k}": v})
-
-            print(f"Epoch {epoch} - Test Loss: {eval_stats['loss']:.4f}")
+            epoch_test_loss = np.mean(test_losses)
+            print(f"Epoch {epoch} - Test Loss: {epoch_test_loss:.4f}")
 
         # --- Training ---
         model.train()
-        train_stats = defaultdict(list)
+        batch_losses = []
+        batch_grad_norms = []
 
         for batch in train_loader:
             loss, stats = forward(batch)
@@ -241,16 +265,11 @@ def train_step(
             optimizer.zero_grad()
             loss.backward()
 
-            if args.log_wandb:
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.norm(2).item() ** 2
-                total_norm = total_norm ** 0.5
-                wandb.log({
-                    f"dagger-{step_id}/grad_norm": total_norm,
-                    f"dagger-{step_id}/lr": optimizer.param_groups[0]["lr"],
-                })
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            batch_grad_norms.append(total_norm ** 0.5)
 
             if args.gradient_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -258,12 +277,20 @@ def train_step(
             optimizer.step()
             scheduler.step()
 
-            for k, v in stats.items():
-                train_stats[k].append(v)
+            batch_losses.append(stats["loss"])
 
+        # --- Single wandb.log per epoch ---
         if args.log_wandb:
-            for k, v in train_stats.items():
-                wandb.log({f"dagger-{step_id}/{k}": np.mean(v)})
+            log_dict = {
+                "global_epoch": global_epoch,
+                "dagger_step": step_id,
+                "train/loss": np.mean(batch_losses),
+                "train/grad_norm": np.mean(batch_grad_norms),
+                "train/lr": optimizer.param_groups[0]["lr"],
+            }
+            if epoch_test_loss is not None:
+                log_dict["test/loss"] = epoch_test_loss
+            wandb.log(log_dict)
 
         if epoch % save_freq == 0:
             torch.save(
@@ -281,9 +308,9 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="darkroom-easy")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--dataset_size", type=int, default=10000)
+    parser.add_argument("--dataset_size", type=int, default=1000)
     parser.add_argument("--dagger_steps", type=int, default=3)
-    parser.add_argument("--n_envs", type=int, default=10000)
+    parser.add_argument("--n_envs", type=int, default=1000)
 
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -316,6 +343,8 @@ if __name__ == "__main__":
             config=vars(args),
             name=f"{args.exp_name}-{args.env_name}-seed{args.seed}",
         )
+        wandb.define_metric("global_epoch")
+        wandb.define_metric("*", step_metric="global_epoch")
 
     # ------------------------------------------------------------------
     # Seed everything
@@ -389,6 +418,8 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # DAgger loop
     # ------------------------------------------------------------------
+    global_epoch_offset = 0
+
     for step_idx in range(args.dagger_steps):
         print(f"\n{'='*60}")
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
@@ -419,7 +450,11 @@ if __name__ == "__main__":
             args=args,
             device=device,
             action_dim=action_dim,
+            global_epoch_offset=global_epoch_offset,
         )
+
+        eval_global_epoch = global_epoch_offset + args.num_epochs - 1
+        global_epoch_offset += args.num_epochs
 
         # --- Evaluate ---
         print(f"\nEvaluating after DAgger step {step_idx}...")
@@ -447,10 +482,23 @@ if __name__ == "__main__":
         if args.log_wandb:
             final_mean = eval_results["mean_returns"][-1]
             final_std = eval_results["std_returns"][-1]
-            wandb.log({
-                f"eval/step_{step_idx}_return": final_mean,
-                f"eval/step_{step_idx}_return_std": final_std,
-            })
+            eval_log = {
+                "global_epoch": eval_global_epoch,
+                "eval/return": final_mean,
+                "eval/return_std": final_std,
+                "eval/dagger_step": step_idx,
+            }
+
+            video_path = os.path.join(eval_save_dir, "eval_video.mp4")
+            video_result = generate_eval_video(
+                eval_results["trajs"], args.env_name, video_path, num_trajs=9
+            )
+            if video_result:
+                eval_log["eval/video"] = wandb.Video(
+                    video_path, fps=4, format="mp4"
+                )
+
+            wandb.log(eval_log)
 
         print(
             f"Evaluation complete - Return: "
