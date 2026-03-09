@@ -8,6 +8,7 @@ Supported environments:
 4. keydoor-markovian: 5x5 grid, continuous rewards after key/door
 5. navigation-episodic: 2D continuous, horizon=10, resets between episodes
 6. navigation-nonepisodic: 2D continuous, horizon=10, no reset between episodes
+7. junction-N: Plus-shaped maze, corridor length N (default 3), hidden goal
 """
 
 from itertools import combinations
@@ -16,6 +17,7 @@ import numpy as np
 
 from envs.darkroom_env import DarkroomEnv, DarkroomEnvVec
 from envs.keydoor_env import KeyDoorEnv, KeyDoorVecEnv
+from envs.junction_env import JunctionEnv, JunctionEnvVec
 from envs.navigation_env import NavigationEnv, NavigationVecEnv
 
 
@@ -40,12 +42,13 @@ def create_darkroom_env(env_name, dataset_size, n_envs):
         train_envs, test_envs, eval_envs: Lists of vectorized environments
     """
     # if env_name == "darkroom-easy":
-    if "easy" in env_name:
-        dim, horizon = 10, 100
+    if "easy-small" in env_name:
+        dim, horizon = 5, 100
+    elif "easy" in env_name:
+        # dim, horizon = 10, 100
+        dim, horizon = 10, 500
     elif "hard" in env_name:
         dim, horizon = 20, 200
-    elif "easy-small" in env_name:
-        dim, horizon = 5, 50
     else:
         raise ValueError(f"Unknown darkroom variant: {env_name} - should be easy or hard")
 
@@ -153,7 +156,7 @@ def create_navigation_env(env_name, dataset_size, n_envs):
         train_envs, test_envs, eval_envs: Lists of vectorized environments
     """
     radius = 1.0
-    horizon = 20
+    horizon = 100
     goal_tolerance = 0.2
     reset_free = "nonepisodic" in env_name
 
@@ -199,6 +202,45 @@ def create_navigation_env(env_name, dataset_size, n_envs):
     return train_envs, test_envs, eval_envs
 
 
+def create_junction_env(env_name, dataset_size, n_envs):
+    """
+    Create Junction maze environments.
+
+    Args:
+        env_name: "junction" (default L=3) or "junction-N" for corridor length N
+        dataset_size: Number of environments to create
+        n_envs: Batch size for vectorized environments
+
+    Returns:
+        train_envs, test_envs, eval_envs: Lists of vectorized environments
+    """
+    parts = env_name.split("-")
+    corridor_length = int(parts[1]) if len(parts) > 1 else 3
+    horizon = 8 * corridor_length
+    L = corridor_length
+
+    goals = np.array([
+        [0, L],       # left
+        [2 * L, L],   # right
+        [L, 2 * L],   # up
+    ])
+
+    n_repeats = max(1, dataset_size // len(goals))
+    train_goals = np.tile(goals, (n_repeats, 1))
+    test_goals = np.tile(goals, (max(1, n_repeats // 5), 1))
+    eval_goals = np.tile(goals, (max(1, 100 // len(goals)), 1))
+
+    train_envs = [JunctionEnv(corridor_length, g, horizon) for g in train_goals]
+    test_envs = [JunctionEnv(corridor_length, g, horizon) for g in test_goals]
+    eval_envs = [JunctionEnv(corridor_length, g, horizon) for g in eval_goals]
+
+    train_envs = _batch_envs(train_envs, JunctionEnvVec, n_envs)
+    test_envs = _batch_envs(test_envs, JunctionEnvVec, n_envs)
+    eval_envs = _batch_envs(eval_envs, JunctionEnvVec, n_envs)
+
+    return train_envs, test_envs, eval_envs
+
+
 def create_env(env_name, dataset_size, n_envs):
     """
     Create environments based on name.
@@ -217,6 +259,8 @@ def create_env(env_name, dataset_size, n_envs):
         return create_keydoor_env(env_name, dataset_size, n_envs)
     elif "navigation" in env_name:
         return create_navigation_env(env_name, dataset_size, n_envs)
+    elif "junction" in env_name:
+        return create_junction_env(env_name, dataset_size, n_envs)
     else:
         raise ValueError(f"Unknown environment: {env_name}")
 
@@ -230,6 +274,7 @@ def test_all_envs():
         "darkroom-hard",
         "keydoor-nonmarkovian",
         "keydoor-markovian",
+        "junction-3",
     ]
     
     for name in env_names:
