@@ -189,15 +189,21 @@ def merge_trajs(trajs):
         "expert_actions": [],
     }
     
+    goals = []
     for traj in trajs:
         merged["states"].append(traj["states"])
         merged["actions"].append(traj["actions"])
         merged["rewards"].append(traj["rewards"])
         merged["dones"].append(traj["dones"])
         merged["expert_actions"].append(traj["expert_actions"])
+        if "goal" in traj:
+            goals.append(traj["goal"])
     
     for key in merged:
         merged[key] = np.stack(merged[key], axis=0)
+    
+    if goals:
+        merged["goals"] = np.array(goals)
     
     return merged
 
