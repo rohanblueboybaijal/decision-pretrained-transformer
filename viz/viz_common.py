@@ -7,6 +7,9 @@ logic used by both darkroom and junction visualizers.
 
 import pickle
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 ACTION_NAMES = {0: "right", 1: "left", 2: "down", 3: "up", 4: "stay"}
@@ -157,3 +160,32 @@ def match_by_goal(expert_trajs, learner_trajs, num_trajs):
         expert_sel.append(goal_to_expert[key][0])
 
     return expert_sel, learner_sel, True
+
+
+def plot_eval_returns_histogram(episode_returns, n_bins, step_idx):
+    """
+    Plot a histogram of evaluation episode returns.
+
+    Divides the range [min(returns), max(returns)] into n_bins bins.
+    Returns a matplotlib figure (caller should close it after logging).
+
+    Args:
+        episode_returns: 1D array or list of scalar returns (one per episode).
+        n_bins: Number of bins in the histogram.
+        step_idx: DAgger step index (for title only).
+    """
+    returns = np.asarray(episode_returns).flatten()
+    if len(returns) == 0:
+        return None
+    r_min, r_max = returns.min(), returns.max()
+    if r_min == r_max:
+        r_max = r_min + 1  # avoid single-bin edge case for linspace
+    bins = np.linspace(r_min, r_max, n_bins + 1)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(returns, bins=bins, edgecolor="black", alpha=0.7)
+    ax.set_xlabel("Return")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Eval returns histogram (DAgger step {step_idx})")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig

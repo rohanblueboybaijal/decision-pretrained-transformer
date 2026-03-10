@@ -23,11 +23,15 @@ import argparse
 import os
 import pickle
 import random
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
 import wandb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from create_envs import create_env
 from collect_data import get_dagger_dataset, merge_sequence_datasets
@@ -35,7 +39,7 @@ from dataset import collate_fn
 from eval_policy import evaluate_policy_on_envs
 from get_rollout_policy import get_rollout_policy
 from models import DecisionTransformer
-from viz.viz_common import sample_diverse_trajectories
+from viz.viz_common import sample_diverse_trajectories, plot_eval_returns_histogram
 
 
 def generate_eval_video(eval_trajs, env_name, save_path, num_trajs=9):
@@ -324,6 +328,12 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
     parser.add_argument("--save_interval", type=float, default=0.1)
+    parser.add_argument(
+        "--num_eval_trajs",
+        type=int,
+        default=9,
+        help="Number of eval trajectories for video and for returns histogram bins",
+    )
 
     parser.add_argument("--log_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
@@ -345,6 +355,7 @@ if __name__ == "__main__":
         )
         wandb.define_metric("global_epoch")
         wandb.define_metric("*", step_metric="global_epoch")
+        wandb.define_metric("eval_returns_histogram", step_metric="dagger_step")
 
     # ------------------------------------------------------------------
     # Seed everything
@@ -360,8 +371,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(
-        args.save_dir, f"{args.exp_name}-{args.env_name}-seed{args.seed}"
+        args.save_dir, f"{args.exp_name}-{args.env_name}-seed{args.seed}-{timestamp}"
     )
     os.makedirs(save_dir, exist_ok=True)
 
@@ -421,10 +433,23 @@ if __name__ == "__main__":
     global_epoch_offset = 0
 
     for step_idx in range(args.dagger_steps):
+        # Effective dataset size = total (history, action) pairs (expert queried at every state in history DAgger)
+        effective_size = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
+
         print(f"\n{'='*60}")
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
         print(f"Dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+        print(f"Effective dataset size (expert-queried state-action pairs): {effective_size}")
         print(f"{'='*60}")
+
+        if args.log_wandb:
+            wandb.log({
+                "global_epoch": global_epoch_offset,
+                "dagger_step": step_idx,
+                "dataset/train_trajectories": len(train_dataset),
+                "dataset/test_trajectories": len(test_dataset),
+                "dataset/effective_size": effective_size,
+            })
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -480,6 +505,7 @@ if __name__ == "__main__":
         )
 
         if args.log_wandb:
+            num_eval_trajs = args.num_eval_trajs
             final_mean = eval_results["mean_returns"][-1]
             final_std = eval_results["std_returns"][-1]
             eval_log = {
@@ -491,7 +517,7 @@ if __name__ == "__main__":
 
             video_path = os.path.join(eval_save_dir, "eval_video.mp4")
             video_result = generate_eval_video(
-                eval_results["trajs"], args.env_name, video_path, num_trajs=9
+                eval_results["trajs"], args.env_name, video_path, num_trajs=num_eval_trajs
             )
             if video_result:
                 eval_log["eval/video"] = wandb.Video(
@@ -499,6 +525,16 @@ if __name__ == "__main__":
                 )
 
             wandb.log(eval_log)
+
+            # Eval returns histogram (step metric: dagger_step)
+            episode_returns = eval_results["episode_returns"]
+            hist_fig = plot_eval_returns_histogram(episode_returns, num_eval_trajs, step_idx)
+            if hist_fig is not None:
+                wandb.log({
+                    "dagger_step": step_idx,
+                    "eval_returns_histogram": wandb.Image(hist_fig),
+                })
+                plt.close(hist_fig)
 
         print(
             f"Evaluation complete - Return: "
