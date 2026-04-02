@@ -13,7 +13,6 @@ __pycache__
 datasets*
 slurm_logs*
 wandb/
-*.sh
 
 archive
 results

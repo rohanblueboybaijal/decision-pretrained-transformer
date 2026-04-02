@@ -29,7 +29,7 @@ def _batch_envs(envs, vec_env_class, n_envs):
     ]
 
 
-def create_darkroom_env(env_name, dataset_size, n_envs):
+def create_darkroom_env(env_name, dataset_size, n_envs, eval_ood=True):
     """
     Create Darkroom environments.
     
@@ -37,6 +37,8 @@ def create_darkroom_env(env_name, dataset_size, n_envs):
         env_name: "darkroom-easy" (10x10, H=100) or "darkroom-hard" (20x20, H=200)
         dataset_size: Number of environments to create
         n_envs: Batch size for vectorized environments
+        eval_ood: If True (default), 80/20 disjoint split. If False, train uses
+            all goals and test/eval are a random subset of all goals.
     
     Returns:
         train_envs, test_envs, eval_envs: Lists of vectorized environments
@@ -55,20 +57,29 @@ def create_darkroom_env(env_name, dataset_size, n_envs):
     # Generate all grid positions as goals
     goals = np.array([[i, j] for i in range(dim) for j in range(dim)])
     np.random.RandomState(seed=0).shuffle(goals)
-    
-    # 80/20 train/test split
-    split_idx = int(0.8 * len(goals))
-    train_goals = goals[:split_idx]
-    test_goals = goals[split_idx:]
+
+    if eval_ood:
+        # 80/20 train/test split (disjoint)
+        split_idx = int(0.8 * len(goals))
+        train_goals = goals[:split_idx]
+        test_goals = goals[split_idx:]
+    else:
+        # Train uses all goals; test/eval are a random subset
+        train_goals = goals
+        n_test = len(goals) - int(0.8 * len(goals))
+        test_idxs = np.random.RandomState(seed=1).choice(
+            len(goals), size=n_test, replace=False
+        )
+        test_goals = goals[test_idxs]
     
     # Repeat goals to match dataset_size
-    n_repeats = max(1, dataset_size // len(goals))
+    n_repeats = max(1, dataset_size // len(train_goals))
     train_goals = np.repeat(train_goals, n_repeats, axis=0)
     test_goals = np.repeat(test_goals, n_repeats, axis=0)
     
-    # Eval goals: use test goals, ensure at least 100
-    eval_factor = max(1, 100 // len(goals[split_idx:]))
-    eval_goals = np.tile(goals[split_idx:], (eval_factor, 1))
+    # Eval goals: same as test goals, ensure at least 100
+    eval_factor = max(1, 100 // len(test_goals))
+    eval_goals = np.tile(test_goals, (eval_factor, 1))
 
     # Create single environments
     train_envs = [DarkroomEnv(dim, goal, horizon) for goal in train_goals]
@@ -143,7 +154,7 @@ def create_keydoor_env(env_name, dataset_size, n_envs):
     return train_envs, test_envs, eval_envs
 
 
-def create_navigation_env(env_name, dataset_size, n_envs):
+def create_navigation_env(env_name, dataset_size, n_envs, eval_ood=True):
     """
     Create 2D Navigation environments.
     
@@ -151,6 +162,8 @@ def create_navigation_env(env_name, dataset_size, n_envs):
         env_name: "navigation-episodic" or "navigation-nonepisodic"
         dataset_size: Number of environments to create
         n_envs: Batch size for vectorized environments
+        eval_ood: If True (default), 80/20 disjoint split. If False, train uses
+            all goals and test/eval are a random subset of all goals.
     
     Returns:
         train_envs, test_envs, eval_envs: Lists of vectorized environments
@@ -165,20 +178,29 @@ def create_navigation_env(env_name, dataset_size, n_envs):
     angles = np.linspace(0, np.pi, n_goals)
     goals = np.array([[radius * np.cos(a), radius * np.sin(a)] for a in angles])
     np.random.RandomState(seed=0).shuffle(goals)
-    
-    # 80/20 train/test split
-    split_idx = int(0.8 * len(goals))
-    train_goals = goals[:split_idx]
-    test_goals = goals[split_idx:]
+
+    if eval_ood:
+        # 80/20 train/test split (disjoint)
+        split_idx = int(0.8 * len(goals))
+        train_goals = goals[:split_idx]
+        test_goals = goals[split_idx:]
+    else:
+        # Train uses all goals; test/eval are a random subset
+        train_goals = goals
+        n_test = len(goals) - int(0.8 * len(goals))
+        test_idxs = np.random.RandomState(seed=1).choice(
+            len(goals), size=n_test, replace=False
+        )
+        test_goals = goals[test_idxs]
     
     # Repeat goals to match dataset_size
-    n_repeats = max(1, dataset_size // len(goals))
+    n_repeats = max(1, dataset_size // len(train_goals))
     train_goals = np.repeat(train_goals, n_repeats, axis=0)
     test_goals = np.repeat(test_goals, n_repeats, axis=0)
     
-    # Eval goals: use test goals, ensure at least 100
-    eval_factor = max(1, 100 // len(goals[split_idx:]))
-    eval_goals = np.tile(goals[split_idx:], (eval_factor, 1))
+    # Eval goals: same as test goals, ensure at least 100
+    eval_factor = max(1, 100 // len(test_goals))
+    eval_goals = np.tile(test_goals, (eval_factor, 1))
 
     # Create single environments
     train_envs = [
@@ -241,7 +263,7 @@ def create_junction_env(env_name, dataset_size, n_envs):
     return train_envs, test_envs, eval_envs
 
 
-def create_env(env_name, dataset_size, n_envs):
+def create_env(env_name, dataset_size, n_envs, eval_ood=True):
     """
     Create environments based on name.
     
@@ -249,16 +271,19 @@ def create_env(env_name, dataset_size, n_envs):
         env_name: Environment identifier
         dataset_size: Number of environments to create  
         n_envs: Batch size for vectorized environments
+        eval_ood: If True (default), test/eval goals are disjoint from train.
+            If False, train uses all goals and test/eval are a subset.
+            Only affects darkroom and navigation environments.
     
     Returns:
         train_envs, test_envs, eval_envs: Lists of vectorized environments
     """
     if "darkroom" in env_name:
-        return create_darkroom_env(env_name, dataset_size, n_envs)
+        return create_darkroom_env(env_name, dataset_size, n_envs, eval_ood=eval_ood)
     elif "keydoor" in env_name:
         return create_keydoor_env(env_name, dataset_size, n_envs)
     elif "navigation" in env_name:
-        return create_navigation_env(env_name, dataset_size, n_envs)
+        return create_navigation_env(env_name, dataset_size, n_envs, eval_ood=eval_ood)
     elif "junction" in env_name:
         return create_junction_env(env_name, dataset_size, n_envs)
     else:
