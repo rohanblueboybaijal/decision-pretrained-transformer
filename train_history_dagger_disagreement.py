@@ -194,15 +194,24 @@ def train_step(
 
     def forward_batch(batch, model):
         batch = {k: v.to(device) for k, v in batch.items()}
-        true_actions = batch["expert_actions"]
         pred_actions, _ = model(batch)
+
+        if args.label_strategy == "blend":
+            loss_mask_expanded = batch["loss_mask"].unsqueeze(-1)
+            true_actions = (
+                batch["expert_actions"] * loss_mask_expanded
+                + batch["actions"] * (1.0 - loss_mask_expanded)
+            )
+            mask = batch["attention_mask"].float()
+        else:
+            true_actions = batch["expert_actions"]
+            mask = batch["attention_mask"].float() * batch["loss_mask"]
 
         per_token_loss = F.cross_entropy(
             pred_actions.reshape(-1, action_dim),
             true_actions.reshape(-1, action_dim),
             reduction="none",
         )
-        mask = batch["attention_mask"].float() * batch["loss_mask"]
         per_token_loss = per_token_loss.reshape(mask.shape)
         denom = mask.sum().clamp(min=1e-8)
         loss = (per_token_loss * mask).sum() / denom
@@ -280,9 +289,16 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="darkroom-easy")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--dataset_size", type=int, default=1000)
+    parser.add_argument("--dataset_size", type=int, default=5000)
     parser.add_argument("--dagger_steps", type=int, default=3)
-    parser.add_argument("--n_envs", type=int, default=1000)
+    parser.add_argument("--n_envs", type=int, default=5000)
+    parser.add_argument(
+        "--eval_ood",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If set (default), test/eval goals are disjoint from train. "
+             "Use --no-eval_ood for in-distribution test/eval.",
+    )
 
     parser.add_argument("--num_ensemble", type=int, default=3)
     parser.add_argument(
@@ -297,6 +313,14 @@ if __name__ == "__main__":
         default=0.0,
         help="Disagreement value stored for step 0 (no ensemble yet)",
     )
+    parser.add_argument(
+        "--label_strategy",
+        type=str,
+        default="mask",
+        choices=["mask", "blend"],
+        help="'mask': loss only on expert-queried positions. "
+             "'blend': expert labels where queried, learner labels elsewhere, loss on all.",
+    )
 
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -309,7 +333,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
-    parser.add_argument("--save_interval", type=float, default=0.1)
+    parser.add_argument("--save_interval", type=float, default=1)
 
     parser.add_argument(
         "--num_eval_trajs",
@@ -334,7 +358,7 @@ if __name__ == "__main__":
             project=args.wandb_project,
             entity=args.wandb_entity,
             config=vars(args),
-            name=f"{args.exp_name}-{args.env_name}-thresh{args.disagreement_threshold}-seed{args.seed}",
+            name=f"{args.exp_name}-{args.env_name}-thresh{args.disagreement_threshold}-{args.label_strategy}-seed{args.seed}",
         )
         wandb.define_metric("global_epoch")
         wandb.define_metric("*", step_metric="global_epoch")
@@ -365,9 +389,9 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Environments
     # ------------------------------------------------------------------
-    print(f"Creating environments: {args.env_name}")
+    print(f"Creating environments: {args.env_name} (eval_ood={args.eval_ood})")
     train_envs, test_envs, eval_envs = create_env(
-        args.env_name, args.dataset_size, args.n_envs
+        args.env_name, args.dataset_size, args.n_envs, eval_ood=args.eval_ood
     )
 
     state_dim = train_envs[0]._envs[0].state_dim
@@ -429,16 +453,21 @@ if __name__ == "__main__":
     # DAgger loop
     # ------------------------------------------------------------------
     for step_idx in range(args.dagger_steps):
-        # Effective dataset size: expert-queried pairs as % of total (threshold=0 would be 100%)
-        effective_abs = sum(int(traj["loss_mask"].sum()) for traj in train_dataset.trajs)
-        total_possible = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
-        effective_size_pct = (effective_abs / total_possible * 100.0) if total_possible > 0 else 100.0
+        expert_queried_tokens = sum(int(traj["loss_mask"].sum()) for traj in train_dataset.trajs)
+        total_tokens = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
+        expert_query_rate = (expert_queried_tokens / total_tokens * 100.0) if total_tokens > 0 else 100.0
+        if args.label_strategy == "blend":
+            effective_size_pct = 100.0
+        else:
+            effective_size_pct = expert_query_rate
 
         print(f"\n{'='*60}")
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
         print(f"Dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
-        print(f"Effective dataset size (expert-queried % of total): {effective_size_pct:.1f}%")
+        print(f"Expert query rate: {expert_query_rate:.1f}%")
+        print(f"Effective dataset size (tokens contributing to loss): {effective_size_pct:.1f}%")
         print(f"Disagreement threshold: {args.disagreement_threshold}")
+        print(f"Label strategy: {args.label_strategy}")
         print(f"{'='*60}")
 
         if args.log_wandb:
@@ -447,6 +476,7 @@ if __name__ == "__main__":
                 "dagger_step": step_idx,
                 "dataset/train_trajectories": len(train_dataset),
                 "dataset/test_trajectories": len(test_dataset),
+                "dataset/expert_query_rate": expert_query_rate,
                 "dataset/effective_size": effective_size_pct,
             })
 

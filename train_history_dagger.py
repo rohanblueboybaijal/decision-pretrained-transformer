@@ -312,9 +312,16 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="darkroom-easy")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--dataset_size", type=int, default=1000)
+    parser.add_argument("--dataset_size", type=int, default=5000)
     parser.add_argument("--dagger_steps", type=int, default=3)
-    parser.add_argument("--n_envs", type=int, default=1000)
+    parser.add_argument("--n_envs", type=int, default=5000)
+    parser.add_argument(
+        "--eval_ood",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If set (default), test/eval goals are disjoint from train. "
+             "Use --no-eval_ood for in-distribution test/eval.",
+    )
 
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_heads", type=int, default=4)
@@ -327,7 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
-    parser.add_argument("--save_interval", type=float, default=0.1)
+    parser.add_argument("--save_interval", type=float, default=1)
     parser.add_argument(
         "--num_eval_trajs",
         type=int,
@@ -380,9 +387,9 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Environments
     # ------------------------------------------------------------------
-    print(f"Creating environments: {args.env_name}")
+    print(f"Creating environments: {args.env_name} (eval_ood={args.eval_ood})")
     train_envs, test_envs, eval_envs = create_env(
-        args.env_name, args.dataset_size, args.n_envs
+        args.env_name, args.dataset_size, args.n_envs, eval_ood=args.eval_ood
     )
 
     state_dim = train_envs[0]._envs[0].state_dim
@@ -433,13 +440,13 @@ if __name__ == "__main__":
     global_epoch_offset = 0
 
     for step_idx in range(args.dagger_steps):
-        # Effective dataset size = total (history, action) pairs (expert queried at every state in history DAgger)
-        effective_size = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
+        total_possible = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
+        effective_size_pct = 100.0
 
         print(f"\n{'='*60}")
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
         print(f"Dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
-        print(f"Effective dataset size (expert-queried state-action pairs): {effective_size}")
+        print(f"Effective dataset size (expert-queried % of total): {effective_size_pct:.1f}%")
         print(f"{'='*60}")
 
         if args.log_wandb:
@@ -448,7 +455,7 @@ if __name__ == "__main__":
                 "dagger_step": step_idx,
                 "dataset/train_trajectories": len(train_dataset),
                 "dataset/test_trajectories": len(test_dataset),
-                "dataset/effective_size": effective_size,
+                "dataset/effective_size": effective_size_pct,
             })
 
         train_loader = torch.utils.data.DataLoader(
