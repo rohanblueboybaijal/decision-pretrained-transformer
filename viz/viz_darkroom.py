@@ -308,7 +308,7 @@ def render_trajectory_video(expert_trajs_list, learner_trajs_list,
                     markersize=14, zorder=14, markeredgecolor="white",
                     markeredgewidth=2.0)
 
-            cum_reward = float(np.sum(lr_rewards[:t_i + 1]))
+            cum_reward = float(np.sum(lr_rewards[:t_i]))
             ax.set_title(
                 f"Goal ({int(goal[0])}, {int(goal[1])})\n"
                 f"Step {t_i}/{T_i - 1}   R={cum_reward:.0f}",
