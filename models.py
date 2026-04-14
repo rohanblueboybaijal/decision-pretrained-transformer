@@ -586,6 +586,7 @@ class DecisionTransformer(nn.Module):
             embd_pdrop=self.dropout,
             attn_pdrop=self.dropout,
             use_cache=False,
+            vocab_size=1,
         )
         self.transformer = GPT2Model(gpt_config)
 

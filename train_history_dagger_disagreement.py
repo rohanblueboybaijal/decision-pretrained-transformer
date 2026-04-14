@@ -47,6 +47,9 @@ from ensemble_policy import EnsembleTransformerPolicy
 from models import DecisionTransformer
 from viz.viz_common import sample_diverse_trajectories, plot_eval_returns_histogram
 
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_DATA_SAVE_DIR = os.path.join(_PROJECT_ROOT, "data", "history_dagger_disagreement_results")
+
 METRICS_JSON_NAME = "metrics.json"
 
 
@@ -376,7 +379,7 @@ if __name__ == "__main__":
              "Use --no-eval_ood for in-distribution test/eval.",
     )
 
-    parser.add_argument("--num_ensemble", type=int, default=3)
+    parser.add_argument("--num_ensemble", type=int, default=10)
     parser.add_argument(
         "--disagreement_threshold",
         type=float,
@@ -409,7 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
-    parser.add_argument("--save_interval", type=float, default=1)
+    parser.add_argument("--save_interval", type=float, default=2)
     parser.add_argument(
         "--save_model",
         action=argparse.BooleanOptionalAction,
@@ -424,12 +427,32 @@ if __name__ == "__main__":
         default=9,
         help="Number of eval trajectories for video and for returns histogram bins",
     )
+    parser.add_argument(
+        "--visualize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate video and histogram/plot visualizations (disable with --no-visualize). "
+        "All underlying data is always logged to metrics.json and wandb so visualizations "
+        "can be recreated offline.",
+    )
 
     parser.add_argument("--log_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument(
+        "--wandb_tags",
+        nargs="*",
+        default=None,
+        metavar="TAG",
+        help="Optional wandb run tags (space-separated), e.g. --wandb_tags baseline sweep1",
+    )
 
-    parser.add_argument("--save_dir", type=str, default="./history_dagger_disagreement_results")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=_DEFAULT_DATA_SAVE_DIR,
+        help="Parent directory for run folders (default: <project>/data/history_dagger_disagreement_results).",
+    )
 
     args = parser.parse_args()
 
@@ -437,12 +460,18 @@ if __name__ == "__main__":
     # Logging
     # ------------------------------------------------------------------
     if args.log_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            config=vars(args),
-            name=f"{args.exp_name}-{args.env_name}-thresh{args.disagreement_threshold}-{args.label_strategy}-seed{args.seed}",
-        )
+        wandb_kwargs = {
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "config": vars(args),
+            "name": (
+                f"{args.exp_name}-{args.env_name}-thresh{args.disagreement_threshold}-"
+                f"{args.label_strategy}-seed{args.seed}"
+            ),
+        }
+        if args.wandb_tags:
+            wandb_kwargs["tags"] = list(args.wandb_tags)
+        wandb.init(**wandb_kwargs)
         wandb.define_metric("global_epoch")
         wandb.define_metric("*", step_metric="global_epoch")
         wandb.define_metric("disagreement_by_timestep", step_metric="dagger_step")
@@ -615,27 +644,27 @@ if __name__ == "__main__":
         else:
             step_trajs = train_dataset.trajs
         disc_stats = compute_disagreement_per_timestep_stats(step_trajs, env_horizon)
-        fig = plot_disagreement_by_timestep(step_trajs, env_horizon, step_idx)
-        if fig is not None:
-            if args.log_wandb:
-                log_disc = {
-                    "dagger_step": step_idx,
-                    "global_epoch": eval_global_epoch,
-                    "data/step_kind": step_kind,
-                    "data/is_bc_step": step_idx == 0,
-                    "disagreement_by_timestep": wandb.Image(fig),
-                }
-                if disc_stats is not None:
-                    tbl = wandb.Table(columns=["timestep", "mean", "stderr"])
-                    for t in range(env_horizon):
-                        tbl.add_data(
-                            t,
-                            disc_stats["mean_per_timestep"][t],
-                            disc_stats["stderr_per_timestep"][t],
-                        )
-                    log_disc["data/disagreement_per_timestep_table"] = tbl
-                wandb.log(log_disc)
-            plt.close(fig)
+        if args.log_wandb and disc_stats is not None:
+            log_disc = {
+                "dagger_step": step_idx,
+                "global_epoch": eval_global_epoch,
+                "data/step_kind": step_kind,
+                "data/is_bc_step": step_idx == 0,
+            }
+            tbl = wandb.Table(columns=["timestep", "mean", "stderr"])
+            for t in range(env_horizon):
+                tbl.add_data(
+                    t,
+                    disc_stats["mean_per_timestep"][t],
+                    disc_stats["stderr_per_timestep"][t],
+                )
+            log_disc["data/disagreement_per_timestep_table"] = tbl
+            if args.visualize:
+                fig = plot_disagreement_by_timestep(step_trajs, env_horizon, step_idx)
+                if fig is not None:
+                    log_disc["disagreement_by_timestep"] = wandb.Image(fig)
+                    plt.close(fig)
+            wandb.log(log_disc)
 
         # --- Evaluate ---
         print(f"\nEvaluating after DAgger step {step_idx}...")
@@ -667,23 +696,24 @@ if __name__ == "__main__":
                 "eval/return_std": final_std,
                 "eval/dagger_step": step_idx,
             }
-            video_path = os.path.join(eval_save_dir, "eval_video.mp4")
-            video_result = generate_eval_video(
-                eval_results["trajs"], args.env_name, video_path, num_trajs=num_eval_trajs
-            )
-            if video_result:
-                eval_log["eval/video"] = wandb.Video(video_path, fps=4, format="mp4")
+            if args.visualize:
+                video_path = os.path.join(eval_save_dir, "eval_video.mp4")
+                video_result = generate_eval_video(
+                    eval_results["trajs"], args.env_name, video_path, num_trajs=num_eval_trajs
+                )
+                if video_result:
+                    eval_log["eval/video"] = wandb.Video(video_path, fps=4, format="mp4")
             wandb.log(eval_log)
 
-            # Eval returns histogram (same step metric as disagreement_by_timestep)
-            episode_returns = eval_results["episode_returns"]
-            hist_fig = plot_eval_returns_histogram(episode_returns, num_eval_trajs, step_idx)
-            if hist_fig is not None:
-                wandb.log({
-                    "dagger_step": step_idx,
-                    "eval_returns_histogram": wandb.Image(hist_fig),
-                })
-                plt.close(hist_fig)
+            if args.visualize:
+                episode_returns = eval_results["episode_returns"]
+                hist_fig = plot_eval_returns_histogram(episode_returns, num_eval_trajs, step_idx)
+                if hist_fig is not None:
+                    wandb.log({
+                        "dagger_step": step_idx,
+                        "eval_returns_histogram": wandb.Image(hist_fig),
+                    })
+                    plt.close(hist_fig)
 
         ep_ret = eval_results["episode_returns"].reshape(-1)
         dagger_snapshot = {
@@ -715,6 +745,7 @@ if __name__ == "__main__":
                 "std_return_final": float(eval_results["std_returns"][-1]),
                 "mean_returns_curve": eval_results["mean_returns"].astype(float).tolist(),
                 "std_returns_curve": eval_results["std_returns"].astype(float).tolist(),
+                "episode_returns": ep_ret.astype(float).tolist(),
                 "episode_return_summary": {
                     "min": float(ep_ret.min()),
                     "max": float(ep_ret.max()),

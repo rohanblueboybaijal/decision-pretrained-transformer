@@ -43,6 +43,9 @@ from get_rollout_policy import get_rollout_policy
 from models import DecisionTransformer
 from viz.viz_common import sample_diverse_trajectories, plot_eval_returns_histogram
 
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_DATA_SAVE_DIR = os.path.join(_PROJECT_ROOT, "data", "history_dagger_results")
+
 
 def generate_eval_video(eval_trajs, env_name, save_path, num_trajs=9):
     """Render an MP4 video of sampled eval trajectories.
@@ -353,8 +356,20 @@ if __name__ == "__main__":
     parser.add_argument("--log_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="dpt-sweep")
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument(
+        "--wandb_tags",
+        nargs="*",
+        default=None,
+        metavar="TAG",
+        help="Optional wandb run tags (space-separated), e.g. --wandb_tags baseline sweep1",
+    )
 
-    parser.add_argument("--save_dir", type=str, default="./history_dagger_results")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=_DEFAULT_DATA_SAVE_DIR,
+        help="Parent directory for run folders (default: <project>/data/history_dagger_results).",
+    )
 
     args = parser.parse_args()
 
@@ -362,12 +377,15 @@ if __name__ == "__main__":
     # Logging
     # ------------------------------------------------------------------
     if args.log_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            config=vars(args),
-            name=f"{args.exp_name}-{args.env_name}-seed{args.seed}",
-        )
+        wandb_kwargs = {
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "config": vars(args),
+            "name": f"{args.exp_name}-{args.env_name}-seed{args.seed}",
+        }
+        if args.wandb_tags:
+            wandb_kwargs["tags"] = list(args.wandb_tags)
+        wandb.init(**wandb_kwargs)
         wandb.define_metric("global_epoch")
         wandb.define_metric("*", step_metric="global_epoch")
         wandb.define_metric("eval_returns_histogram", step_metric="dagger_step")
