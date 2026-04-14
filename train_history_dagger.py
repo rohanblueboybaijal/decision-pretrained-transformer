@@ -12,6 +12,8 @@ Algorithm:
    c. New data is merged into the dataset; supervised learning is repeated.
 
 No curriculum over context horizons, no loss masks, no ensemble.
+
+Checkpoints: use ``--no-save_model`` to skip per-epoch and final ``.pth`` saves.
 """
 
 import torch.multiprocessing as mp
@@ -194,7 +196,7 @@ def train_step(
         train_loader: DataLoader over training SequenceDataset.
         test_loader: DataLoader over test SequenceDataset.
         save_dir: Directory for saving checkpoints.
-        args: Namespace with num_epochs, eval_interval, save_interval,
+        args: Namespace with num_epochs, eval_interval, save_interval, save_model,
               gradient_clip, log_wandb.
         device: torch device.
         action_dim: Number of discrete actions.
@@ -296,7 +298,7 @@ def train_step(
                 log_dict["test/loss"] = epoch_test_loss
             wandb.log(log_dict)
 
-        if epoch % save_freq == 0:
+        if args.save_model and epoch % save_freq == 0:
             torch.save(
                 model.state_dict(),
                 os.path.join(step_save_dir, f"model_epoch_{epoch}.pth"),
@@ -335,6 +337,12 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
     parser.add_argument("--save_interval", type=float, default=1)
+    parser.add_argument(
+        "--save_model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save per-epoch and final checkpoints (disable with --no-save_model to save disk).",
+    )
     parser.add_argument(
         "--num_eval_trajs",
         type=int,
@@ -579,7 +587,8 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Save final model
     # ------------------------------------------------------------------
-    torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+    if args.save_model:
+        torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
     print(f"\nTraining complete! Results saved to {save_dir}")
 
     if args.log_wandb:

@@ -6,7 +6,14 @@ Extends train_history_dagger.py with:
 - Expert queried only when ensemble disagreement > threshold.
 - Expert actions stored for all states; loss_mask marks where expert was queried.
 - Loss: masked by loss_mask (Strategy 1 — run on all data, mask in loss).
-- Step 0: expert data with loss_mask=1 and default disagreement value for plotting.
+- Step 0 (BC): expert-only data; per-timestep disagreement is the constant
+  ``default_disagreement`` (no ensemble at collection). Logged as data/step_kind=bc and
+  mirrored in metrics.json for wandb/API alignment.
+- metrics.json: full training log + per-dagger-step snapshots with disagreement arrays.
+  Each snapshot includes ``expert_query_rate`` (full merged buffer) and
+  ``expert_query_rate_this_step`` (only ``dagger_step_k/train_dataset.pkl``).
+
+Checkpoints: ``--no-save_model`` skips per-epoch and final ensemble ``.pth`` saves (same flag as ``train_history_dagger.py``).
 """
 
 import torch.multiprocessing as mp
@@ -15,7 +22,9 @@ if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method("spawn", force=True)
 
 import argparse
+import json
 import os
+from typing import Optional
 import pickle
 import random
 from datetime import datetime
@@ -37,6 +46,70 @@ from get_rollout_policy import get_rollout_policy
 from ensemble_policy import EnsembleTransformerPolicy
 from models import DecisionTransformer
 from viz.viz_common import sample_diverse_trajectories, plot_eval_returns_histogram
+
+METRICS_JSON_NAME = "metrics.json"
+
+
+def _persist_run_metrics(save_dir, run_metrics):
+    path = os.path.join(save_dir, METRICS_JSON_NAME)
+    with open(path, "w") as f:
+        json.dump(run_metrics, f, indent=2, default=str)
+
+
+def init_run_metrics(save_dir, args):
+    """Initialize on-disk metrics mirror (wandb + richer fields like per-timestep disagreement)."""
+    run_metrics = {
+        "created_at": datetime.now().isoformat(),
+        "save_dir": os.path.abspath(save_dir),
+        "config": vars(args).copy(),
+        "epochs": [],
+        "dagger_steps": [],
+    }
+    _persist_run_metrics(save_dir, run_metrics)
+    return run_metrics
+
+
+def expert_query_rate_for_step_dataset(save_dir: str, step_idx: int) -> Optional[float]:
+    """
+    Expert query rate (% of tokens with loss_mask) using only
+    ``dagger_step_{step_idx}/train_dataset.pkl`` — data for this DAgger iteration,
+    not the merged replay buffer.
+
+    Returns None if that pickle is missing.
+    """
+    train_path = os.path.join(save_dir, f"dagger_step_{step_idx}", "train_dataset.pkl")
+    if not os.path.isfile(train_path):
+        return None
+    with open(train_path, "rb") as f:
+        step_dataset = pickle.load(f)
+    trajs = step_dataset.trajs
+    if not trajs:
+        return 0.0
+    expert_queried_tokens = sum(int(t["loss_mask"].sum()) for t in trajs)
+    total_tokens = sum(t["states"].shape[0] for t in trajs)
+    if total_tokens <= 0:
+        return 0.0
+    return expert_queried_tokens / total_tokens * 100.0
+
+
+def compute_disagreement_per_timestep_stats(step_trajs, horizon):
+    """
+    Mean and standard error of ensemble disagreement at each env timestep across trajectories.
+
+    Returns None if trajectories lack 'disagreement' (should not happen in normal runs).
+    """
+    if not step_trajs or "disagreement" not in step_trajs[0]:
+        return None
+    stacked = np.stack([t["disagreement"] for t in step_trajs])
+    mean_disagreement = stacked.mean(axis=0)
+    n = stacked.shape[0]
+    std_error = stacked.std(axis=0) / np.sqrt(n) if n > 1 else np.zeros_like(mean_disagreement)
+    return {
+        "mean_per_timestep": mean_disagreement.astype(np.float64).tolist(),
+        "stderr_per_timestep": std_error.astype(np.float64).tolist(),
+        "n_trajectories": int(n),
+        "horizon": int(horizon),
+    }
 
 
 def generate_eval_video(eval_trajs, env_name, save_path, num_trajs=9):
@@ -147,12 +220,11 @@ def plot_disagreement_by_timestep(step_trajs, horizon, step_idx):
     Compute mean and std error of disagreement per env timestep; return a matplotlib figure.
     step_trajs: list of trajectory dicts with 'disagreement' (horizon,).
     """
-    if not step_trajs or "disagreement" not in step_trajs[0]:
+    stats = compute_disagreement_per_timestep_stats(step_trajs, horizon)
+    if stats is None:
         return None
-    stacked = np.stack([t["disagreement"] for t in step_trajs])
-    mean_disagreement = stacked.mean(axis=0)
-    n = stacked.shape[0]
-    std_error = stacked.std(axis=0) / np.sqrt(n) if n > 1 else np.zeros_like(mean_disagreement)
+    mean_disagreement = np.array(stats["mean_per_timestep"], dtype=np.float64)
+    std_error = np.array(stats["stderr_per_timestep"], dtype=np.float64)
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(np.arange(horizon), mean_disagreement)
     ax.fill_between(
@@ -181,6 +253,7 @@ def train_step(
     device,
     action_dim,
     global_epoch_offset,
+    run_metrics,
 ):
     """
     Train ensemble for one DAgger step. Loss is masked by loss_mask (Strategy 1).
@@ -260,19 +333,22 @@ def train_step(
                 batch_losses.append(loss.item())
 
         # --- Logging ---
+        log_dict = {
+            "global_epoch": global_epoch,
+            "dagger_step": step_id,
+            "train/loss": float(np.mean(batch_losses)),
+            "train/grad_norm": float(np.mean(batch_grad_norms)) if batch_grad_norms else 0.0,
+            "train/lr": float(optimizers[0].param_groups[0]["lr"]),
+        }
+        if epoch_test_loss is not None:
+            log_dict["test/loss"] = float(epoch_test_loss)
+        run_metrics["epochs"].append(log_dict.copy())
+        _persist_run_metrics(save_dir, run_metrics)
+
         if args.log_wandb:
-            log_dict = {
-                "global_epoch": global_epoch,
-                "dagger_step": step_id,
-                "train/loss": np.mean(batch_losses),
-                "train/grad_norm": np.mean(batch_grad_norms) if batch_grad_norms else 0.0,
-                "train/lr": optimizers[0].param_groups[0]["lr"],
-            }
-            if epoch_test_loss is not None:
-                log_dict["test/loss"] = epoch_test_loss
             wandb.log(log_dict)
 
-        if epoch % save_freq == 0:
+        if args.save_model and epoch % save_freq == 0:
             for k, model in enumerate(ensemble):
                 torch.save(
                     model.state_dict(),
@@ -334,6 +410,13 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip", action="store_true")
     parser.add_argument("--eval_interval", type=float, default=0.1)
     parser.add_argument("--save_interval", type=float, default=1)
+    parser.add_argument(
+        "--save_model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save per-epoch and final checkpoints (disable with --no-save_model to save disk when "
+        "using large ensembles).",
+    )
 
     parser.add_argument(
         "--num_eval_trajs",
@@ -363,6 +446,7 @@ if __name__ == "__main__":
         wandb.define_metric("global_epoch")
         wandb.define_metric("*", step_metric="global_epoch")
         wandb.define_metric("disagreement_by_timestep", step_metric="dagger_step")
+        wandb.define_metric("data/disagreement_per_timestep_table", step_metric="dagger_step")
         wandb.define_metric("eval_returns_histogram", step_metric="dagger_step")
 
     # ------------------------------------------------------------------
@@ -385,6 +469,7 @@ if __name__ == "__main__":
         f"{args.exp_name}-{args.env_name}-thresh{args.disagreement_threshold}-seed{args.seed}-{timestamp}",
     )
     os.makedirs(save_dir, exist_ok=True)
+    run_metrics = init_run_metrics(save_dir, args)
 
     # ------------------------------------------------------------------
     # Environments
@@ -456,6 +541,7 @@ if __name__ == "__main__":
         expert_queried_tokens = sum(int(traj["loss_mask"].sum()) for traj in train_dataset.trajs)
         total_tokens = sum(traj["states"].shape[0] for traj in train_dataset.trajs)
         expert_query_rate = (expert_queried_tokens / total_tokens * 100.0) if total_tokens > 0 else 100.0
+        expert_query_rate_this_step = expert_query_rate_for_step_dataset(save_dir, step_idx)
         if args.label_strategy == "blend":
             effective_size_pct = 100.0
         else:
@@ -464,21 +550,29 @@ if __name__ == "__main__":
         print(f"\n{'='*60}")
         print(f"DAgger Step {step_idx}/{args.dagger_steps}")
         print(f"Dataset size - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
-        print(f"Expert query rate: {expert_query_rate:.1f}%")
+        print(f"Expert query rate (full buffer): {expert_query_rate:.1f}%")
+        if expert_query_rate_this_step is not None:
+            print(f"Expert query rate (this DAgger iteration only): {expert_query_rate_this_step:.1f}%")
         print(f"Effective dataset size (tokens contributing to loss): {effective_size_pct:.1f}%")
         print(f"Disagreement threshold: {args.disagreement_threshold}")
         print(f"Label strategy: {args.label_strategy}")
         print(f"{'='*60}")
 
+        step_kind = "bc" if step_idx == 0 else "dagger"
+        dataset_log = {
+            "global_epoch": global_epoch_offset,
+            "dagger_step": step_idx,
+            "data/step_kind": step_kind,
+            "data/is_bc_step": step_idx == 0,
+            "dataset/train_trajectories": len(train_dataset),
+            "dataset/test_trajectories": len(test_dataset),
+            "dataset/expert_query_rate": float(expert_query_rate),
+            "dataset/effective_size": float(effective_size_pct),
+        }
+        if expert_query_rate_this_step is not None:
+            dataset_log["dataset/expert_query_rate_this_step"] = float(expert_query_rate_this_step)
         if args.log_wandb:
-            wandb.log({
-                "global_epoch": global_epoch_offset,
-                "dagger_step": step_idx,
-                "dataset/train_trajectories": len(train_dataset),
-                "dataset/test_trajectories": len(test_dataset),
-                "dataset/expert_query_rate": expert_query_rate,
-                "dataset/effective_size": effective_size_pct,
-            })
+            wandb.log(dataset_log)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -505,6 +599,7 @@ if __name__ == "__main__":
             device=device,
             action_dim=action_dim,
             global_epoch_offset=global_epoch_offset,
+            run_metrics=run_metrics,
         )
 
         eval_global_epoch = global_epoch_offset + args.num_epochs - 1
@@ -519,12 +614,27 @@ if __name__ == "__main__":
             step_trajs = step_dataset.trajs
         else:
             step_trajs = train_dataset.trajs
+        disc_stats = compute_disagreement_per_timestep_stats(step_trajs, env_horizon)
         fig = plot_disagreement_by_timestep(step_trajs, env_horizon, step_idx)
-        if fig is not None and args.log_wandb:
-            wandb.log({
-                "dagger_step": step_idx,
-                "disagreement_by_timestep": wandb.Image(fig),
-            })
+        if fig is not None:
+            if args.log_wandb:
+                log_disc = {
+                    "dagger_step": step_idx,
+                    "global_epoch": eval_global_epoch,
+                    "data/step_kind": step_kind,
+                    "data/is_bc_step": step_idx == 0,
+                    "disagreement_by_timestep": wandb.Image(fig),
+                }
+                if disc_stats is not None:
+                    tbl = wandb.Table(columns=["timestep", "mean", "stderr"])
+                    for t in range(env_horizon):
+                        tbl.add_data(
+                            t,
+                            disc_stats["mean_per_timestep"][t],
+                            disc_stats["stderr_per_timestep"][t],
+                        )
+                    log_disc["data/disagreement_per_timestep_table"] = tbl
+                wandb.log(log_disc)
             plt.close(fig)
 
         # --- Evaluate ---
@@ -575,6 +685,47 @@ if __name__ == "__main__":
                 })
                 plt.close(hist_fig)
 
+        ep_ret = eval_results["episode_returns"].reshape(-1)
+        dagger_snapshot = {
+            "dagger_step": step_idx,
+            "global_epoch_end": eval_global_epoch,
+            "data/step_kind": step_kind,
+            "data/is_bc_step": step_idx == 0,
+            "dataset": {
+                "train_trajectories": len(train_dataset),
+                "test_trajectories": len(test_dataset),
+                "expert_query_rate": float(expert_query_rate),
+                "expert_query_rate_this_step": (
+                    float(expert_query_rate_this_step)
+                    if expert_query_rate_this_step is not None
+                    else None
+                ),
+                "effective_size": float(effective_size_pct),
+            },
+            "disagreement_per_timestep": disc_stats,
+            "disagreement_note": (
+                "BC (step 0): expert-only rollout; values are constant "
+                f"default_disagreement={args.default_disagreement} (no ensemble at collection). "
+                "When pulling from wandb, filter rows with data/is_bc_step or data/step_kind=='bc'."
+                if step_idx == 0
+                else None
+            ),
+            "eval": {
+                "mean_return_final": float(eval_results["mean_returns"][-1]),
+                "std_return_final": float(eval_results["std_returns"][-1]),
+                "mean_returns_curve": eval_results["mean_returns"].astype(float).tolist(),
+                "std_returns_curve": eval_results["std_returns"].astype(float).tolist(),
+                "episode_return_summary": {
+                    "min": float(ep_ret.min()),
+                    "max": float(ep_ret.max()),
+                    "mean": float(ep_ret.mean()),
+                    "num_rollouts": int(ep_ret.size),
+                },
+            },
+        }
+        run_metrics["dagger_steps"].append(dagger_snapshot)
+        _persist_run_metrics(save_dir, run_metrics)
+
         print(
             f"Evaluation complete - Return: "
             f"{eval_results['mean_returns'][0]:.2f} +/- "
@@ -611,8 +762,9 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Save final models
     # ------------------------------------------------------------------
-    for k, model in enumerate(ensemble):
-        torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_{k}.pth"))
+    if args.save_model:
+        for k, model in enumerate(ensemble):
+            torch.save(model.state_dict(), os.path.join(save_dir, f"final_model_{k}.pth"))
     print(f"\nTraining complete! Results saved to {save_dir}")
 
     if args.log_wandb:
