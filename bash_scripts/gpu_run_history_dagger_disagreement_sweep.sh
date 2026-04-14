@@ -5,62 +5,16 @@ set -euo pipefail
 LOG_DIR=${LOG_DIR:-logs}
 mkdir -p "$LOG_DIR"
 
-# ── NVIDIA MPS (Multi-Process Service) ──────────────────────────────────
-# MPS lets all parallel training processes share a single CUDA context,
-# eliminating ~300-500 MB of per-process GPU overhead and enabling true
-# kernel-level concurrency on Ampere (A100) GPUs.
-#
-# Set USE_MPS=false to disable (falls back to default time-sliced sharing).
-USE_MPS=${USE_MPS:-true}
-GPU_ID=${GPU_ID:-0}
-
-_mps_start() {
-  if [ "$USE_MPS" != "true" ]; then
-    return
-  fi
-  echo "Starting NVIDIA MPS daemon on GPU ${GPU_ID}..."
-  export CUDA_VISIBLE_DEVICES="$GPU_ID"
-  export CUDA_MPS_PIPE_DIRECTORY="/tmp/nvidia-mps-${GPU_ID}"
-  export CUDA_MPS_LOG_DIRECTORY="/tmp/nvidia-mps-log-${GPU_ID}"
-  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-
-  # Set GPU to exclusive-process mode so only the MPS server manages it.
-  nvidia-smi -i "$GPU_ID" -c EXCLUSIVE_PROCESS 2>/dev/null || true
-
-  # Start the MPS control daemon.
-  nvidia-cuda-mps-control -d 2>/dev/null || true
-  sleep 1
-
-  if ! echo get_server_list | nvidia-cuda-mps-control >/dev/null 2>&1; then
-    echo "WARNING: MPS daemon may not have started. Continuing without MPS."
-    USE_MPS=false
-    return
-  fi
-  echo "MPS daemon running."
-}
-
-_mps_stop() {
-  if [ "$USE_MPS" != "true" ]; then
-    return
-  fi
-  echo "Stopping NVIDIA MPS daemon..."
-  echo quit | nvidia-cuda-mps-control 2>/dev/null || true
-  sleep 1
-  nvidia-smi -i "$GPU_ID" -c DEFAULT 2>/dev/null || true
-  echo "MPS daemon stopped."
-}
-
-_mps_start
-# ────────────────────────────────────────────────────────────────────────
-
-# With MPS + small models, the A100 can comfortably handle many concurrent
-# runs. Without MPS, keep this at 3 to avoid context-switch overhead.
-# Tune to avoid OOM; monitor with nvidia-smi.
-# Example: MAX_PARALLEL=10 ./bash_scripts/gpu_run_history_dagger_disagreement_sweep.sh
-MAX_PARALLEL=${MAX_PARALLEL:-1}
+# ── Multi-GPU round-robin ──────────────────────────────────────────────
+# Each run is assigned to the next GPU in round-robin order.
+# One concurrent job per GPU — no MPS needed.
+# Override: GPU_IDS="0 1 2 3" ./bash_scripts/gpu_run_history_dagger_disagreement_sweep.sh
+read -ra GPU_IDS <<< "${GPU_IDS:-0 1}"
+NUM_GPUS=${#GPU_IDS[@]}
+MAX_PARALLEL=${MAX_PARALLEL:-$NUM_GPUS}
 
 ENVS=("darkroom-easy-small" "junction-3" "navigation-episodic")
-SEEDS=(1 2 3 4 5)
+SEEDS=(1)
 THRESHOLDS=(0.00001 0.0001 0.001 0.01 0.1 1)
 LABEL_STRATEGIES=("mask" "blend")
 EVAL_OOD=${EVAL_OOD:-false}
@@ -88,8 +42,8 @@ echo "Label strategies:  ${LABEL_STRATEGIES[*]}"
 echo "Eval OOD:          ${EVAL_OOD}"
 echo "Exp name:          ${EXP_NAME}"
 echo "Save model:        ${SAVE_MODEL}"
-echo "NVIDIA MPS:        ${USE_MPS}"
-echo "Max parallel:      ${MAX_PARALLEL} (same GPU; lower if you hit CUDA OOM)"
+echo "GPUs:              ${GPU_IDS[*]} (${NUM_GPUS} GPUs, round-robin)"
+echo "Max parallel:      ${MAX_PARALLEL}"
 echo "Total runs:        ${TOTAL}"
 echo "=========================================="
 
@@ -134,7 +88,6 @@ _sweep_on_interrupt() {
   for pid in $(jobs -p 2>/dev/null); do
     kill -KILL "$pid" 2>/dev/null || true
   done
-  _mps_stop
   exit 130
 }
 trap '_sweep_on_interrupt' INT TERM
@@ -165,7 +118,10 @@ PY
           wait -n 2>/dev/null || sleep 0.5
         done
 
-        python train_history_dagger_disagreement.py \
+        GPU=${GPU_IDS[$(( (RUN - 1) % NUM_GPUS ))]}
+        echo "  → GPU ${GPU}"
+
+        CUDA_VISIBLE_DEVICES=$GPU python train_history_dagger_disagreement.py \
           --env_name "$ENV" \
           --exp_name "$EXP_NAME" \
           --dagger_steps 10 \
@@ -174,9 +130,9 @@ PY
           --wandb_tags seed_sweep \
           --wandb_project history_dagger_v1 \
           --num_epochs 10 \
-          --batch_size 512 \
-          --lr 1e-3 \
-          -- no-visualize \
+          --batch_size 256 \
+          --lr 3e-4 \
+          --no-visualize \
           --disagreement_threshold "$THRESH" \
           --label_strategy "$STRATEGY" \
           $EVAL_OOD_FLAG \
@@ -192,8 +148,6 @@ for pid in "${PIDS[@]}"; do
     ANY_FAIL=1
   fi
 done
-
-_mps_stop
 
 echo ""
 if [ "$ANY_FAIL" -ne 0 ]; then
